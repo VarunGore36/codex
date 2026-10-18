@@ -71,6 +71,7 @@ use crate::remote::RemotePluginChange;
 use crate::remote::RemotePluginMaterialization;
 use crate::remote::RemotePluginScope;
 use crate::remote::RemotePluginServiceConfig;
+use crate::remote::fetch_remote_installed_plugins;
 use crate::remote_legacy::RemotePluginFetchError;
 use crate::remote_legacy::RemotePluginMutationError;
 use crate::remote_plugin_id_resolver::RemoteInstalledPluginsSnapshot;
@@ -888,6 +889,39 @@ impl PluginsManager {
             let plugin_skill_snapshots = new_plugin_skill_snapshots();
             cache_outcome = RequestOutcome::Load;
             let load_started = Instant::now();
+            // The remote-installed plugins cache is populated by a background refresh
+            // started during app-server initialization. Headless/one-shot clients such
+            // as `codex exec` can start a thread before that refresh completes, in
+            // which case the snapshot is empty and remote-installed plugins are
+            // silently skipped. Populate the cache from the server when it is still
+            // empty so remote-installed plugins are available immediately. The fetch
+            // is best-effort: on failure we fall back to the empty snapshot, matching
+            // the previous behavior.
+            if config.remote_plugin_enabled {
+                let cache_empty = self
+                    .remote_installed_plugins_cache
+                    .read()
+                    .is_ok_and(|cache| cache.plugins.is_none());
+                if cache_empty {
+                    let auth = self.auth_manager.auth_cached();
+                    let auth_ref = auth.as_ref();
+                    if let Ok(plugins) = fetch_remote_installed_plugins(
+                        &config.remote_plugin_service_config(),
+                        auth_ref,
+                    )
+                    .await
+                        && let Some(generation) =
+                            self.prepare_remote_installed_plugins_cache_generation(auth_ref)
+                    {
+                        let _ = self.write_remote_installed_plugins_cache_snapshot(
+                            generation,
+                            plugins,
+                            auth_ref,
+                            RemoteInstalledPluginsCachePublication::Refresh,
+                        );
+                    }
+                }
+            }
             let plugins = load_plugins_from_layer_stack(
                 &config.config_layer_stack,
                 &config.plugins,
